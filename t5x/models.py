@@ -289,7 +289,12 @@ class BaseTransformerModel(BaseModel):
       dropout_rng: Optional[jax.random.KeyArray],
   ) -> Tuple[jnp.ndarray, MetricsMap]:
     """Loss function used for training with a cross-entropy loss."""
-    logits = self._compute_logits(params, batch, dropout_rng)
+    logits = self._compute_logits(params,
+                                  batch,
+                                  dropout_rng,
+                                  mutable=False,
+                                  other_variables=flax_mutables)
+
 
     loss_normalizing_factor: Optional[
         Union[float, int, str, losses.SpecialLossNormalizingFactor]

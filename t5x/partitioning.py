@@ -508,6 +508,7 @@ def standard_logical_axis_rules(
       ('layers', None),
       ('stack', None),
       ('mlp_activations', None),
+      ('fp8_params', None),
   ]
   rules.extend(replicated_rules)
 

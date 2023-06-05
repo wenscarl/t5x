@@ -679,8 +679,7 @@ def accumulate_grads_microbatched(
       (_, metrics), grad_accum = grad_fn(train_state.params, batch, dropout_rng)
       flax_mutables = None
     else:
-      (_, (metrics,
-           flax_mutables)), grad_accum = grad_fn(train_state.params, batch,
+      (_, metrics), (grad_accum, flax_mutables) = grad_fn(train_state.params, batch,
                                                  dropout_rng,
                                                  initial_flax_mutables)
   else:

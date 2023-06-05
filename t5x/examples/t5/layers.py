@@ -337,31 +337,25 @@ def _canonicalize_tuple(x):
 # DenseGeneral for attention layers.
 # ------------------------------------------------------------------------------
 class DenseGeneral(nn.Module):
-  """A linear transformation (without bias) with flexible axes.
-
-    Attributes:
-      features: tuple with numbers of output features.
-      axis: tuple with axes to apply the transformation on.
-      dtype: the dtype of the computation (default: float32).
-      kernel_init: initializer function for the weight matrix.
-  """
   features: Union[Iterable[int], int]
   axis: Union[Iterable[int], int] = -1
-  dtype: DType = jnp.float32
-  kernel_init: Initializer = nn.initializers.variance_scaling(
-      1.0, 'fan_in', 'truncated_normal')
+  use_bias: bool = False
+  dtype: Optional[DType] = None
+  param_dtype: DType = jnp.float32
+  amax_history_length: int = 16
+  kernel_init: Callable[[PRNGKey, Shape, DType], Array] = \
+      nn.initializers.lecun_normal()
+  bias_init: Callable[[PRNGKey, Shape, DType], Array] = nn.initializers.zeros
+  activation: Optional[ActivationFn] = None
+  dot_general: DotGeneralT = lax.dot_general
   kernel_axes: Tuple[str, ...] = ()
+  bias_axes: Tuple[str, ...] = ()
 
   @nn.compact
   def __call__(self, inputs: Array) -> Array:
-    """Applies a linear transformation to the inputs along multiple dimensions.
+    original_shape = inputs.shape
+    assert len(original_shape) >= 2
 
-    Args:
-      inputs: The nd-array to be transformed.
-
-    Returns:
-      The transformed input.
-    """
     features = _canonicalize_tuple(self.features)
     axis = _canonicalize_tuple(self.axis)
 
@@ -371,17 +365,100 @@ class DenseGeneral(nn.Module):
     kernel_shape = tuple([inputs.shape[ax] for ax in axis]) + features
     kernel_param_shape = (np.prod([inputs.shape[ax] for ax in axis]),
                           np.prod(features))
+
     kernel = param_with_axes(
         'kernel',
         self.kernel_init,
         kernel_param_shape,
-        jnp.float32,
+        self.param_dtype,
         axes=self.kernel_axes)
     kernel = jnp.asarray(kernel, self.dtype)
-    kernel = jnp.reshape(kernel, kernel_shape)
 
-    contract_ind = tuple(range(0, len(axis)))
-    return lax.dot_general(inputs, kernel, ((axis, contract_ind), ((), ())))
+    if self.use_bias:
+      bias = param_with_axes(
+          'bias',
+          self.bias_init,
+          (np.prod(features),),
+          self.param_dtype,
+          axes=self.bias_axes)
+      bias = jnp.asarray(bias, self.dtype)
+    else:
+      bias = None
+
+    scale_args = (
+        nn.initializers.ones_init(),
+  #      jax.random.PRNGKey(0),
+        (1,),
+        jnp.float32,
+    )
+    amax_history_args = (
+        nn.initializers.zeros_init(),
+  #      jax.random.PRNGKey(0),
+        (self.amax_history_length,),
+        jnp.float32,
+    )
+
+    input_amax_history = variable_with_axes(
+        FP8Helper.FP8_COLLECTION_NAME, 'input_amax_history', *amax_history_args, axes=('fp8_params',))
+    kernel_amax_history = variable_with_axes(
+        FP8Helper.FP8_COLLECTION_NAME, 'kernel_amax_history',
+        *amax_history_args, axes=('fp8_params',))
+    output_grad_amax_history = variable_with_axes(
+        FP8Helper.FP8_COLLECTION_NAME, 'output_grad_amax_history',
+        *amax_history_args, axes=('fp8_params',))
+
+    input_scale = variable_with_axes(
+        FP8Helper.FP8_COLLECTION_NAME, 'input_scale', *scale_args, axes=())
+    kernel_scale = variable_with_axes(
+        FP8Helper.FP8_COLLECTION_NAME, 'kernel_scale', *scale_args, axes=())
+    output_grad_scale = variable_with_axes(
+        FP8Helper.FP8_COLLECTION_NAME, 'output_grad_scale', *scale_args, axes=())
+    inputs, kernel = nn.dtypes.promote_dtype(inputs, kernel, 
+                                                   dtype=self.dtype)
+
+    # Reshape the inputs to 2D matrix.
+#    inp_mat = jnp.reshape(inputs, (-1, original_shape[-1]))
+    input_batch_dims = []
+    tmp = [i for i in range(inputs.ndim)]
+    for i in tmp:
+      if i not in axis:
+        input_batch_dims.append(i)
+    input_param_shape = (np.prod([inputs.shape[ax] for ax in input_batch_dims])
+                        ,np.prod([inputs.shape[ax] for ax in axis]))
+
+    inp_mat = jnp.reshape(inputs, input_param_shape)
+    kernel = jnp.reshape(kernel, kernel_param_shape)
+
+
+    inp_mat = in_qdq(self.dtype, inp_mat, input_scale,
+                     input_amax_history)
+    kernel = in_qdq(self.dtype, kernel, kernel_scale,
+                    kernel_amax_history)
+
+    # Actual dense layer math.
+    out = lax.dot(inp_mat, kernel)
+
+    out = out_qdq(self.dtype, out, output_grad_scale,
+                  output_grad_amax_history)
+
+    if self.use_bias:
+      # The bias has already been promoted. So, if it is fp32, we need to cast
+      # it to bf16 to trigger fp8 matmul fusion.
+      if bias.dtype == jnp.float32:
+        bias = bias.astype(jnp.bfloat16)
+        bias = bias.astype(jnp.float32)
+      out = out + bias
+
+    if self.activation:
+      out = self.activation(out)
+
+    # Reshape back the outputs.
+#    out = jnp.reshape(out, (*original_shape[0:-len(axis)], out.shape[-1]))
+    out_shape = [inputs.shape[ax] for ax in input_batch_dims] + list(features)
+    out = jnp.reshape(out, out_shape)
+  
+    return out
+
 
 
 def _convert_to_activation_function(
