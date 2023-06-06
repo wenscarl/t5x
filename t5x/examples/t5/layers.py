@@ -15,14 +15,15 @@
 """Dense attention classes and mask/weighting functions."""
 
 # pylint: disable=attribute-defined-outside-init,g-bare-generic
-
+from functools import partial
 import dataclasses
 import functools
 import operator
-from typing import Any, Callable, Iterable, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Iterable, Optional, Sequence, Tuple, Union, Dict
 
 from flax import linen as nn
 from flax.linen import partitioning as nn_partitioning
+from flax.core.frozen_dict import FrozenDict
 import jax
 from jax import lax
 from jax import random
@@ -33,11 +34,15 @@ import numpy as np
 # from flax.linen.partitioning import param_with_axes, with_sharding_constraint
 param_with_axes = nn_partitioning.param_with_axes
 with_sharding_constraint = nn_partitioning.with_sharding_constraint
+variable_with_axes = nn_partitioning.variable_with_axes
 
 
 # Type annotations
 Array = jnp.ndarray
 DType = jnp.dtype
+ActivationFn = Callable[..., Array]
+DotGeneralT = Callable[..., Array]
+Collection = Union[Dict, FrozenDict]
 PRNGKey = jnp.ndarray
 Shape = Sequence[int]
 Activation = Callable[..., Array]
@@ -46,6 +51,22 @@ Initializer = Callable[[PRNGKey, Shape, DType], Array]
 
 default_embed_init = nn.initializers.variance_scaling(
     1.0, 'fan_in', 'normal', out_axis=0)
+class FP8Helper:
+  FP8_COLLECTION_NAME: str = "fp8_params"
+
+  @staticmethod
+  def update_fp8_params(state: Collection, grads: Collection) -> Collection:
+    """
+    Update the FP8 params
+    """
+    if FP8Helper.FP8_COLLECTION_NAME in state:
+      if not isinstance(state, FrozenDict):
+        state = FrozenDict(state)
+      others, fp8_params = state.pop(FP8Helper.FP8_COLLECTION_NAME)
+      new_fp8_params = grads[FP8Helper.FP8_COLLECTION_NAME]
+      return FrozenDict({**others,
+                         FP8Helper.FP8_COLLECTION_NAME : new_fp8_params})
+    return state
 
 
 def dot_product_attention(query: Array,
@@ -97,6 +118,7 @@ def dot_product_attention(query: Array,
     key = key.astype(jnp.float32)
 
   # `attn_weights`: [batch, num_heads, q_length, kv_length]
+  print('xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx inputs to einsum', query.shape, key.shape)
   attn_weights = jnp.einsum('bqhd,bkhd->bhqk', query, key)
 
   # Apply attention bias: masking, dropout, proximity bias, etc.
@@ -125,6 +147,216 @@ def dot_product_attention(query: Array,
 
 dynamic_vector_slice_in_dim = jax.vmap(
     lax.dynamic_slice_in_dim, in_axes=(None, 0, None, None))
+FAKE_E4M3 = jnp.float8_e4m3fn
+FAKE_E5M2 = jnp.float8_e5m2
+
+def get_fp8_max(fp8_dtype):
+  assert fp8_dtype in (FAKE_E4M3, FAKE_E5M2)
+  return jnp.finfo(fp8_dtype).max.astype(jnp.float32)
+
+def quantize(x, q_dtype, scale, compute_dtype):
+  # We need to explicitly cast the max value to compute_dtype, otherwise the jax
+  # dtype promotion will cast the scaled_x to fp32 in the following ops, which
+  # would violate the fp8-matmul pattern matching.
+  dtype_max = get_fp8_max(q_dtype).astype(compute_dtype)
+
+  scaled_x = x / scale.astype(compute_dtype)
+  clipped_x = jnp.clip(scaled_x, -dtype_max, dtype_max)
+
+  return clipped_x.astype(q_dtype)
+
+def dequantize(x, dq_dtype, scale):
+  return x.astype(dq_dtype) * scale.astype(dq_dtype)
+
+def quantize_dequantize(x, q_dtype, scale, compute_dtype):
+  qx = quantize(x, q_dtype, scale, compute_dtype)
+  return dequantize(qx, x.dtype, scale)
+
+def compute_scale(amax, scale, fp8_max, margin=0):
+  """Default function to convert amax to scaling factor."""
+  exp = jnp.floor(jnp.log2(fp8_max / amax)) - margin
+  sf = jnp.round(lax.pow(2., jnp.abs(exp)))
+  sf = jnp.where(amax > 0.0, sf, scale)
+  sf = jnp.where(lax.is_finite(amax), sf, scale)
+  sf = jnp.where(exp < 0, 1.0 / sf, sf)
+  # The scaling factor we need equals to the notion of "scale_inv" in
+  # TransformerEngine. So, we convert the sf to its reciprocal.
+  return 1.0 / sf
+
+def compute_scale_and_amax_history(x, q_dtype, scale, amax_history):
+  dtype_max = get_fp8_max(q_dtype)
+
+  amax_update = jnp.max(jnp.abs(x)).astype(scale.dtype)
+  new_amax_history = \
+      jnp.roll(amax_history, shift=-1, axis=0).at[0].set(amax_update)
+
+  amax_from_history = jnp.max(new_amax_history, axis=0)
+  new_scale = compute_scale(amax_from_history, scale, dtype_max)
+  return new_scale, new_amax_history
+
+def qdq_and_return(x, q_dtype, scale, amax_history, compute_dtype):
+  qx = quantize_dequantize(x, q_dtype, scale, compute_dtype)
+  new_scale, new_amax_history = compute_scale_and_amax_history(
+      x, q_dtype, scale, amax_history)
+  return qx, new_scale, new_amax_history
+
+@partial(jax.custom_vjp, nondiff_argnums=(0,))
+def in_qdq(compute_dtype, inp, scale, amax_history):
+  qin, _, _ = qdq_and_return(
+      inp, FAKE_E4M3, scale, amax_history, compute_dtype)
+  return qin
+
+def in_qdq_fwd(compute_dtype, inp, scale, amax_history):
+  qin, new_scale, new_amax_history = qdq_and_return(
+      inp, FAKE_E4M3, scale, amax_history, compute_dtype)
+  return qin, (new_scale, new_amax_history)
+
+def in_qdq_bwd(compute_dtype, res, g):
+  new_scale, new_amax_history = res
+  q_g = g
+  return q_g, new_scale, new_amax_history
+
+in_qdq.defvjp(in_qdq_fwd, in_qdq_bwd)
+
+
+@partial(jax.custom_vjp, nondiff_argnums=(0,))
+def out_qdq(compute_dtype, out, scale, amax_history):
+  return out
+
+def out_qdq_fwd(compute_dtype, out, scale, amax_history):
+  return out, (scale, amax_history)
+
+def out_qdq_bwd(compute_dtype, res, g):
+  scale, amax_history = res
+  q_g, new_scale, new_amax_history = qdq_and_return(
+      g, FAKE_E5M2, scale, amax_history, compute_dtype)
+  return q_g, new_scale, new_amax_history
+  
+out_qdq.defvjp(out_qdq_fwd, out_qdq_bwd)
+
+# This is F8
+class DenseGeneral(nn.Module):
+  features: Union[Iterable[int], int]
+  axis: Union[Iterable[int], int] = -1
+  use_bias: bool = False
+  dtype: Optional[DType] = None
+  param_dtype: DType = jnp.float32
+  amax_history_length: int = 16
+  kernel_init: Callable[[PRNGKey, Shape, DType], Array] = \
+      nn.initializers.lecun_normal()
+  bias_init: Callable[[PRNGKey, Shape, DType], Array] = nn.initializers.zeros
+  activation: Optional[ActivationFn] = None
+  dot_general: DotGeneralT = lax.dot_general
+  kernel_axes: Tuple[str, ...] = ()
+  bias_axes: Tuple[str, ...] = ()
+
+  @nn.compact
+  def __call__(self, inputs: Array) -> Array:
+    original_shape = inputs.shape
+    assert len(original_shape) >= 2
+
+    features = _canonicalize_tuple(self.features)
+    axis = _canonicalize_tuple(self.axis)
+
+    inputs = jnp.asarray(inputs, self.dtype)
+    axis = _normalize_axes(axis, inputs.ndim)
+
+    kernel_shape = tuple([inputs.shape[ax] for ax in axis]) + features
+    kernel_param_shape = (np.prod([inputs.shape[ax] for ax in axis]),
+                          np.prod(features))
+
+    kernel = param_with_axes(
+        'kernel',
+        self.kernel_init,
+        kernel_param_shape,
+        self.param_dtype,
+        axes=self.kernel_axes)
+    kernel = jnp.asarray(kernel, self.dtype)
+
+    if self.use_bias:
+      bias = param_with_axes(
+          'bias',
+          self.bias_init,
+          (np.prod(features),),
+          self.param_dtype,
+          axes=self.bias_axes)
+      bias = jnp.asarray(bias, self.dtype)
+    else:
+      bias = None
+
+    scale_args = (
+        nn.initializers.ones_init(),
+  #      jax.random.PRNGKey(0),
+        (1,),
+        jnp.float32,
+    )
+    amax_history_args = (
+        nn.initializers.zeros_init(),
+  #      jax.random.PRNGKey(0),
+        (self.amax_history_length,),
+        jnp.float32,
+    )
+
+# xla-fp8
+    input_amax_history = self.param(
+        'input_amax_history_fp8_meta', *amax_history_args)
+    kernel_amax_history = self.param(
+        'kernel_amax_history_fp8_meta', *amax_history_args)
+    output_grad_amax_history = self.param(
+        'output_grad_amax_history_fp8_meta', *amax_history_args)
+
+    input_scale = self.param('input_scale_fp8_meta', *scale_args)
+    kernel_scale = self.param('kernel_scale_fp8_meta', *scale_args)
+    output_grad_scale = self.param('output_grad_scale_fp8_meta', *scale_args)
+
+
+
+#    inputs, kernel, bias = nn.dtypes.promote_dtype(inputs, kernel, bias,
+#                                                   dtype=self.dtype)
+    inputs, kernel = nn.dtypes.promote_dtype(inputs, kernel, 
+                                                   dtype=self.dtype)
+
+    # Reshape the inputs to 2D matrix.
+#    inp_mat = jnp.reshape(inputs, (-1, original_shape[-1]))
+    input_batch_dims = []
+    tmp = [i for i in range(inputs.ndim)]
+    for i in tmp:
+      if i not in axis:
+        input_batch_dims.append(i)
+    input_param_shape = (np.prod([inputs.shape[ax] for ax in input_batch_dims])
+                        ,np.prod([inputs.shape[ax] for ax in axis]))
+
+    inp_mat = jnp.reshape(inputs, input_param_shape)
+    kernel = jnp.reshape(kernel, kernel_param_shape)
+
+
+    inp_mat = in_qdq(self.dtype, inp_mat, input_scale,
+                     input_amax_history)
+    kernel = in_qdq(self.dtype, kernel, kernel_scale,
+                    kernel_amax_history)
+
+    # Actual dense layer math.
+    out = lax.dot(inp_mat, kernel)
+
+    out = out_qdq(self.dtype, out, output_grad_scale,
+                  output_grad_amax_history)
+
+    if self.use_bias:
+      # The bias has already been promoted. So, if it is fp32, we need to cast
+      # it to bf16 to trigger fp8 matmul fusion.
+      if bias.dtype == jnp.float32:
+        bias = bias.astype(jnp.bfloat16)
+        bias = bias.astype(jnp.float32)
+      out = out + bias
+
+    if self.activation:
+      out = self.activation(out)
+
+    # Reshape back the outputs.
+    out_shape = [inputs.shape[ax] for ax in input_batch_dims] + list(features)
+    out = jnp.reshape(out, out_shape)
+  
+    return out
 
 
 class MultiHeadDotProductAttention(nn.Module):
@@ -201,6 +433,7 @@ class MultiHeadDotProductAttention(nn.Module):
 
     # Project inputs_q to multi-headed q/k/v
     # dimensions are then [batch, length, num_heads, head_dim]
+    print('ZZZZZZZZ inputs_q, kv:', inputs_q.shape, inputs_kv.shape)
     query = projection(kernel_init=query_init, name='query')(inputs_q)
     key = projection(kernel_init=self.kernel_init, name='key')(inputs_kv)
     value = projection(kernel_init=self.kernel_init, name='value')(inputs_kv)
@@ -331,58 +564,6 @@ def _canonicalize_tuple(x):
     return tuple(x)
   else:
     return (x,)
-
-
-# ------------------------------------------------------------------------------
-# DenseGeneral for attention layers.
-# ------------------------------------------------------------------------------
-class DenseGeneral(nn.Module):
-  """A linear transformation (without bias) with flexible axes.
-
-    Attributes:
-      features: tuple with numbers of output features.
-      axis: tuple with axes to apply the transformation on.
-      dtype: the dtype of the computation (default: float32).
-      kernel_init: initializer function for the weight matrix.
-  """
-  features: Union[Iterable[int], int]
-  axis: Union[Iterable[int], int] = -1
-  dtype: DType = jnp.float32
-  kernel_init: Initializer = nn.initializers.variance_scaling(
-      1.0, 'fan_in', 'truncated_normal')
-  kernel_axes: Tuple[str, ...] = ()
-
-  @nn.compact
-  def __call__(self, inputs: Array) -> Array:
-    """Applies a linear transformation to the inputs along multiple dimensions.
-
-    Args:
-      inputs: The nd-array to be transformed.
-
-    Returns:
-      The transformed input.
-    """
-    features = _canonicalize_tuple(self.features)
-    axis = _canonicalize_tuple(self.axis)
-
-    inputs = jnp.asarray(inputs, self.dtype)
-    axis = _normalize_axes(axis, inputs.ndim)
-
-    kernel_shape = tuple([inputs.shape[ax] for ax in axis]) + features
-    kernel_param_shape = (np.prod([inputs.shape[ax] for ax in axis]),
-                          np.prod(features))
-    kernel = param_with_axes(
-        'kernel',
-        self.kernel_init,
-        kernel_param_shape,
-        jnp.float32,
-        axes=self.kernel_axes)
-    kernel = jnp.asarray(kernel, self.dtype)
-    kernel = jnp.reshape(kernel, kernel_shape)
-
-    contract_ind = tuple(range(0, len(axis)))
-    return lax.dot_general(inputs, kernel, ((axis, contract_ind), ((), ())))
-
 
 def _convert_to_activation_function(
     fn_or_string: Union[str, Callable]) -> Callable:
