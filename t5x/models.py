@@ -40,6 +40,7 @@ from t5x import optimizers
 import tensorflow as tf
 import typing_extensions
 
+import inspect
 # Remove _ShardedDeviceArray when users of t5x have their types updated
 _ShardedDeviceArray = Any
 Array = Union[np.ndarray, jnp.ndarray, _ShardedDeviceArray, tf.Tensor]
@@ -287,8 +288,10 @@ class BaseTransformerModel(BaseModel):
       params: PyTree,
       batch: Mapping[str, jnp.ndarray],
       dropout_rng: Optional[jax.random.KeyArray],
+      flax_mutables: Optional[PyTree] = None,
   ) -> Tuple[jnp.ndarray, MetricsMap]:
     """Loss function used for training with a cross-entropy loss."""
+#    logits = self._compute_logits(params, batch, dropout_rng)
     logits = self._compute_logits(params,
                                   batch,
                                   dropout_rng,
@@ -822,7 +825,7 @@ class DecoderOnlyModel(BaseTransformerModel):
         jnp.ones(decoder_shape, decoder_type),
         enable_dropout=False,
     )
-    return flax_core.freeze(initial_variables)
+    return initial_variables
 
   def _get_decoder_causal_attention(self, batch):
     """Returns decoder causal attention from the batch or None."""
