@@ -19,10 +19,11 @@
 import dataclasses
 import functools
 import operator
-from typing import Any, Callable, Iterable, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Iterable, Optional, Sequence, Tuple, Union, Dict
 
 from flax import linen as nn
 from flax.linen import partitioning as nn_partitioning
+from flax.core.frozen_dict import FrozenDict
 import jax
 from jax import lax
 from jax import random
@@ -32,12 +33,16 @@ import numpy as np
 
 # from flax.linen.partitioning import param_with_axes, with_sharding_constraint
 param_with_axes = nn_partitioning.param_with_axes
+variable_with_axes = nn_partitioning.variable_with_axes
 with_sharding_constraint = nn_partitioning.with_sharding_constraint
 
 
 # Type annotations
 Array = jnp.ndarray
 DType = jnp.dtype
+ActivationFn = Callable[..., Array]
+DotGeneralT = Callable[..., Array]
+Collection = Union[Dict, FrozenDict]
 PRNGKey = jnp.ndarray
 Shape = Sequence[int]
 Activation = Callable[..., Array]
@@ -46,6 +51,24 @@ Initializer = Callable[[PRNGKey, Shape, DType], Array]
 
 default_embed_init = nn.initializers.variance_scaling(
     1.0, 'fan_in', 'normal', out_axis=0)
+
+class FP8Helper:
+  FP8_COLLECTION_NAME: str = "fp8_params"
+
+  @staticmethod
+  def update_fp8_params(state: Collection, grads: Collection) -> Collection:
+    """
+    Update the FP8 params
+    """
+    if FP8Helper.FP8_COLLECTION_NAME in state:
+      if not isinstance(state, FrozenDict):
+        state = FrozenDict(state)
+      others, fp8_params = state.pop(FP8Helper.FP8_COLLECTION_NAME)
+      new_fp8_params = grads[FP8Helper.FP8_COLLECTION_NAME]
+      return FrozenDict({**others,
+                         FP8Helper.FP8_COLLECTION_NAME : new_fp8_params})
+    return state
+
 
 
 def dot_product_attention(query: Array,
@@ -332,6 +355,93 @@ def _canonicalize_tuple(x):
   else:
     return (x,)
 
+FAKE_E4M3 = jnp.float8_e4m3fn
+FAKE_E5M2 = jnp.float8_e5m2
+
+def get_fp8_max(fp8_dtype):
+  assert fp8_dtype in (FAKE_E4M3, FAKE_E5M2)
+  return jnp.finfo(fp8_dtype).max.astype(jnp.float32)
+
+def quantize(x, q_dtype, scale, compute_dtype):
+  # We need to explicitly cast the max value to compute_dtype, otherwise the jax
+  # dtype promotion will cast the scaled_x to fp32 in the following ops, which
+  # would violate the fp8-matmul pattern matching.
+  dtype_max = get_fp8_max(q_dtype).astype(compute_dtype)
+
+  scaled_x = x / scale.astype(compute_dtype)
+  clipped_x = jnp.clip(scaled_x, -dtype_max, dtype_max)
+
+  return clipped_x.astype(q_dtype)
+
+def dequantize(x, dq_dtype, scale):
+  return x.astype(dq_dtype) * scale.astype(dq_dtype)
+
+def quantize_dequantize(x, q_dtype, scale, compute_dtype):
+  qx = quantize(x, q_dtype, scale, compute_dtype)
+  return dequantize(qx, x.dtype, scale)
+
+def compute_scale(amax, scale, fp8_max, margin=0):
+  """Default function to convert amax to scaling factor."""
+  exp = jnp.floor(jnp.log2(fp8_max / amax)) - margin
+  sf = jnp.round(lax.pow(2., jnp.abs(exp)))
+  sf = jnp.where(amax > 0.0, sf, scale)
+  sf = jnp.where(lax.is_finite(amax), sf, scale)
+  sf = jnp.where(exp < 0, 1.0 / sf, sf)
+  # The scaling factor we need equals to the notion of "scale_inv" in
+  # TransformerEngine. So, we convert the sf to its reciprocal.
+  return 1.0 / sf
+
+def compute_scale_and_amax_history(x, q_dtype, scale, amax_history):
+  dtype_max = get_fp8_max(q_dtype)
+
+#  amax_update = jnp.max(jnp.abs(x)).astype(scale.dtype)
+  amax_update = 0.75
+  new_amax_history = \
+      jnp.roll(amax_history, shift=-1, axis=0).at[0].set(amax_update)
+
+  amax_from_history = jnp.max(new_amax_history, axis=0)
+  new_scale = compute_scale(amax_from_history, scale, dtype_max)
+  return new_scale, new_amax_history
+
+def qdq_and_return(x, q_dtype, scale, amax_history, compute_dtype):
+  qx = quantize_dequantize(x, q_dtype, scale, compute_dtype)
+  new_scale, new_amax_history = compute_scale_and_amax_history(
+      x, q_dtype, scale, amax_history)
+  return qx, new_scale, new_amax_history
+
+@functools.partial(jax.custom_vjp, nondiff_argnums=(0,))
+def in_qdq(compute_dtype, inp, scale, amax_history):
+  qin, _, _ = qdq_and_return(
+      inp, FAKE_E4M3, scale, amax_history, compute_dtype)
+  return qin
+
+def in_qdq_fwd(compute_dtype, inp, scale, amax_history):
+  qin, new_scale, new_amax_history = qdq_and_return(
+      inp, FAKE_E4M3, scale, amax_history, compute_dtype)
+  return qin, (new_scale, new_amax_history)
+
+def in_qdq_bwd(compute_dtype, res, g):
+  new_scale, new_amax_history = res
+  q_g = g
+  return q_g, new_scale, new_amax_history
+
+in_qdq.defvjp(in_qdq_fwd, in_qdq_bwd)
+
+
+@functools.partial(jax.custom_vjp, nondiff_argnums=(0,))
+def out_qdq(compute_dtype, out, scale, amax_history):
+  return out
+
+def out_qdq_fwd(compute_dtype, out, scale, amax_history):
+  return out, (scale, amax_history)
+
+def out_qdq_bwd(compute_dtype, res, g):
+  scale, amax_history = res
+  q_g, new_scale, new_amax_history = qdq_and_return(
+      g, FAKE_E5M2, scale, amax_history, compute_dtype)
+  return q_g, new_scale, new_amax_history
+  
+out_qdq.defvjp(out_qdq_fwd, out_qdq_bwd)
 
 # ------------------------------------------------------------------------------
 # DenseGeneral for attention layers.
@@ -387,13 +497,13 @@ class DenseGeneral(nn.Module):
 
     scale_args = (
         nn.initializers.ones_init(),
-  #      jax.random.PRNGKey(0),
+        jax.random.PRNGKey(0),
         (1,),
         jnp.float32,
     )
     amax_history_args = (
         nn.initializers.zeros_init(),
-  #      jax.random.PRNGKey(0),
+        jax.random.PRNGKey(0),
         (self.amax_history_length,),
         jnp.float32,
     )
@@ -430,16 +540,16 @@ class DenseGeneral(nn.Module):
     kernel = jnp.reshape(kernel, kernel_param_shape)
 
 
-    inp_mat = in_qdq(self.dtype, inp_mat, input_scale,
-                     input_amax_history)
-    kernel = in_qdq(self.dtype, kernel, kernel_scale,
-                    kernel_amax_history)
+    inp_mat = in_qdq(self.dtype, inp_mat, input_scale.value,
+                     input_amax_history.value)
+    kernel = in_qdq(self.dtype, kernel, kernel_scale.value,
+                    kernel_amax_history.value)
 
     # Actual dense layer math.
     out = lax.dot(inp_mat, kernel)
 
-    out = out_qdq(self.dtype, out, output_grad_scale,
-                  output_grad_amax_history)
+    out = out_qdq(self.dtype, out, output_grad_scale.value,
+                  output_grad_amax_history.value)
 
     if self.use_bias:
       # The bias has already been promoted. So, if it is fp32, we need to cast
