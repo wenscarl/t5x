@@ -664,7 +664,11 @@ def accumulate_grads_microbatched(
   """
   batch_size = next(iter(batch.values())).shape[0]
 
-  grad_fn = jax.value_and_grad(model.loss_fn, has_aux=True)
+  if(train_state.flax_mutables):
+    grad_fn = jax.value_and_grad(model.loss_fn, has_aux=True, argnums=[0,3])
+  else:
+    grad_fn = jax.value_and_grad(model.loss_fn, has_aux=True)
+
 
   # We assume that the model loss_fn supports flax mutables if and only if
   # the train state includes non-empty flax mutables.
@@ -679,8 +683,7 @@ def accumulate_grads_microbatched(
       (_, metrics), grad_accum = grad_fn(train_state.params, batch, dropout_rng)
       flax_mutables = None
     else:
-      (_, (metrics,
-           flax_mutables)), grad_accum = grad_fn(train_state.params, batch,
+      (_, metrics), (grad_accum, flax_mutables) = grad_fn(train_state.params, batch,
                                                  dropout_rng,
                                                  initial_flax_mutables)
   else:
