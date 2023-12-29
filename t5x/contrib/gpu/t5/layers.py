@@ -29,6 +29,7 @@ from jax import random
 import jax.numpy as jnp
 import numpy as np
 
+from t5x.xla_fp8_helper import XLAFp8Config
 
 # from flax.linen.partitioning import param_with_axes, with_sharding_constraint
 param_with_axes = nn_partitioning.param_with_axes
@@ -43,6 +44,14 @@ Shape = Iterable[int]
 Activation = Callable[..., Array]
 # Parameter initializers.
 Initializer = Callable[[PRNGKey, Shape, DType], Array]
+DotGeneralT = Callable[..., Array]
+PrecisionLike = Union[
+    None,
+    str,
+    lax.Precision,
+    Tuple[str, str],
+    Tuple[lax.Precision, lax.Precision],
+]
 
 default_embed_init = nn.initializers.variance_scaling(
     1.0, 'fan_in', 'normal', out_axis=0)
@@ -192,6 +201,7 @@ class MultiHeadDotProductAttention(nn.Module):
         axis=-1,
         features=(self.num_heads, self.head_dim),
         kernel_axes=('embed', 'joined_kv'),
+        dot_general_cls=nn.Fp8DotGeneralOp if XLAFp8Config().enabled else None,
         dtype=self.dtype)
 
     # NOTE: T5 does not explicitly rescale the attention logits by
@@ -318,6 +328,7 @@ class MultiHeadDotProductAttention(nn.Module):
         kernel_init=self.kernel_init,
         kernel_axes=('joined_kv', 'embed'),
         dtype=self.dtype,
+        dot_general_cls=nn.Fp8DotGeneralOp if XLAFp8Config().enabled else None,
         name='out')(
             x)
     return out
@@ -353,6 +364,10 @@ class DenseGeneral(nn.Module):
   kernel_init: Initializer = nn.initializers.variance_scaling(
       1.0, 'fan_in', 'truncated_normal')
   kernel_axes: Tuple[str, ...] = ()
+  precision: PrecisionLike = None
+  # Deprecated. Will be removed.
+  dot_general: DotGeneralT = lax.dot_general
+  dot_general_cls: Any = None
 
   @nn.compact
   def __call__(self, inputs: Array) -> Array:
@@ -383,7 +398,11 @@ class DenseGeneral(nn.Module):
     kernel = jnp.reshape(kernel, kernel_shape)
 
     contract_ind = tuple(range(0, len(axis)))
-    return lax.dot_general(inputs, kernel, ((axis, contract_ind), ((), ())))
+    if self.dot_general_cls is not None:
+      dot_general = self.dot_general_cls()
+    else:
+      dot_general = self.dot_general
+    return dot_general(inputs, kernel, ((axis, contract_ind), ((), ())), precision=self.precision)
 
 
 def _convert_to_activation_function(
@@ -432,7 +451,8 @@ class MlpBlock(nn.Module):
           dtype=self.dtype,
           kernel_init=self.kernel_init,
           kernel_axes=('embed', 'mlp'),
-          name=dense_name)(
+          name=dense_name,
+          dot_general_cls=nn.Fp8DotGeneralOp if XLAFp8Config().enabled else None)(
               inputs)
       x = _convert_to_activation_function(act_fn)(x)
       activations.append(x)
@@ -449,7 +469,8 @@ class MlpBlock(nn.Module):
         dtype=self.dtype,
         kernel_init=self.kernel_init,
         kernel_axes=('mlp', 'embed'),
-        name='wo')(
+        name='wo',
+        dot_general_cls=nn.Fp8DotGeneralOp if XLAFp8Config().enabled else None)(
             x)
     return output
 
